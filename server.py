@@ -20,6 +20,10 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("STUDIO_API_TOKEN", "")
 
 GPU_LOCK = asyncio.Lock()
+# manual FIFO tracker so each waiting job can see its queue position. asyncio.Lock
+# doesn't expose its internal waiter list, so jobs append their id here on entry
+# and remove it as soon as the lock is acquired.
+QUEUE = []
 
 
 class JobIn(BaseModel):
@@ -57,8 +61,11 @@ async def _run_job(job_id, prompt, use_critic, mode):
     events_file = out / "events.jsonl"
     meta = _load(job_id) or {}
 
+    QUEUE.append(job_id)
     async with GPU_LOCK:
-        meta.update({"status": "running", "started": time.time(), "stage": "starting"})
+        try: QUEUE.remove(job_id)
+        except ValueError: pass
+        meta.update({"status": "running", "started": time.time(), "stage": "starting", "queue_position": 0})
         _save(job_id, meta)
         log.info(f"job {job_id} started ({mode})")
 
@@ -146,15 +153,20 @@ async def submit(body: JobIn, bg: BackgroundTasks):
     return {"job_id": job_id, "status": "queued", "mode": body.mode}
 
 
-@app.get("/demos/{job_id}.mp4")
+@app.api_route("/demos/{job_id}.mp4", methods=["GET", "HEAD"])
 async def demo_video(job_id: str):
-    # public mp4 fetch for demos so an embed in HF Space's <video> tag works without auth
+    # public mp4 for <video> embed: inline disposition + HEAD support so Gradio
+    # mime sniffing works
     meta = _load(job_id)
     if meta is None:
         raise HTTPException(404, "no such job")
     if meta.get("mode") != "demo" or meta.get("status") != "done":
         raise HTTPException(404, "not a completed demo")
-    return FileResponse(meta["video"], media_type="video/mp4", filename=f"demo_{job_id}.mp4")
+    return FileResponse(
+        meta["video"],
+        media_type="video/mp4",
+        headers={"Content-Disposition": f'inline; filename="demo_{job_id}.mp4"'},
+    )
 
 
 @app.get("/demos")
@@ -186,6 +198,9 @@ async def status(job_id: str):
     meta = _load(job_id)
     if meta is None:
         raise HTTPException(404, "no such job")
+    if meta.get("status") == "queued" and job_id in QUEUE:
+        meta["queue_position"] = QUEUE.index(job_id) + 1
+        meta["queue_size"] = len(QUEUE)
     return meta
 
 
