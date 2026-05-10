@@ -1,0 +1,23 @@
+# Core deps for studiomi300. Pin only what we know is broken otherwise.
+# torch / vllm / diffusers come pre-installed in the rocm/vllm-dev container; we add the rest --no-deps.
+gradio>=5.0
+soundfile
+imageio
+imageio-ffmpeg
+kokoro>=0.9.2
+para_attn>=0.3.38
+ftfy
+einops
+# audio gen (ACE-Step transitive)
+py3langid
+librosa
+pypinyin
+hangul-romanize
+num2words
+cutlet
+fugashi[unidic-lite]
+loguru
+pytorch-lightning
+# api server
+fastapi
+uvicorn[standard]

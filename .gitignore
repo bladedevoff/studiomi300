@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# generated
+outputs/
+api_jobs/
+*.mp4
+*.wav
+*.png
+!space/thumbnail.png
+
+# huggingface caches
+.cache/
+huggingface_cache/
+
+# editor / tooling
+.claude/
+.cursor/
+
+# research and dev notes (personal log, kept out of repo)
+research/
+docs/
