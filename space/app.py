@@ -14,6 +14,30 @@ API_URL = (os.environ.get("STUDIO_API_URL", "") or "").rstrip("/")
 API_TOKEN = os.environ.get("STUDIO_API_TOKEN", "")
 API_HEADERS = {"X-API-Token": API_TOKEN} if API_TOKEN else {}
 
+# local mp4 cache — Space downloads from droplet over HTTP (server-side, no
+# mixed-content), then serves to browser over Gradio's HTTPS file route.
+DEMO_CACHE = APP_ROOT / "demo_cache"
+DEMO_CACHE.mkdir(exist_ok=True)
+
+
+def cache_demo_mp4(job_id):
+    """Fetch demo mp4 from droplet API into the Space's local cache. Returns Path or None."""
+    p = DEMO_CACHE / f"{job_id}.mp4"
+    if p.exists() and p.stat().st_size > 1024:
+        return p
+    if not API_URL:
+        return None
+    try:
+        r = requests.get(f"{API_URL}/demos/{job_id}.mp4", timeout=120, stream=True)
+        if r.status_code != 200:
+            return None
+        with open(p, "wb") as f:
+            for chunk in r.iter_content(64 * 1024):
+                f.write(chunk)
+        return p
+    except requests.RequestException:
+        return None
+
 
 SHOWCASE_REELS = [
     {
@@ -70,13 +94,16 @@ def backend_health():
     return "offline"
 
 
-def render_demo_card(d, full_url=True):
+def render_demo_card(d):
     prompt = (d.get("prompt") or "")[:240]
-    url = f"{API_URL}{d['video']}" if full_url else d['video']
     duration = d.get("duration_s") or 0
+    p = cache_demo_mp4(d["id"])
+    if p is None:
+        return ""
+    src = f"/gradio_api/file={p}"  # Gradio HTTPS file route
     return (
         f'<div class="demo-card">'
-        f'<video src="{url}" controls preload="metadata" loop muted></video>'
+        f'<video src="{src}" controls preload="metadata" loop muted playsinline></video>'
         f'<div class="demo-prompt">{prompt}</div>'
         f'<div class="demo-meta">{int(duration)}s render</div>'
         f'</div>'
@@ -111,22 +138,33 @@ STAGE_LABELS = {
     "keyframe_ready": "keyframe ready",
     "wan_loading": "loading Wan2.2-I2V-A14B",
     "wan_rendering": "animating with Wan2.2",
-    "rendered": "rendered, finalising",
+    "rendered": "video rendered",
+    "music_starting": "generating music (ACE-Step)",
+    "music_ready": "music ready",
+    "music_skipped": "music skipped",
+    "music_failed": "music failed (silent video)",
+    "mix_starting": "mixing audio onto video",
+    "mix_done": "final mp4 ready",
     "completed": "done",
     "done": "done",
 }
 
 STAGE_PROGRESS = {
     "queued": 0.02, "starting": 0.04,
-    "klein_loading": 0.10, "keyframe_starting": 0.15, "keyframe_ready": 0.22,
-    "wan_loading": 0.28,
-    "wan_rendering": 0.85,
-    "rendered": 0.96,
+    "klein_loading": 0.08, "keyframe_starting": 0.12, "keyframe_ready": 0.18,
+    "wan_loading": 0.24,
+    "wan_rendering": 0.80,
+    "rendered": 0.86,
+    "music_starting": 0.88,
+    "music_ready": 0.95,
+    "music_skipped": 0.95, "music_failed": 0.95,
+    "mix_starting": 0.97,
+    "mix_done": 1.0,
     "completed": 1.0, "done": 1.0,
 }
 
 
-def submit_demo(prompt, progress=gr.Progress()):
+def submit_demo(prompt):
     if not API_URL:
         raise gr.Error("Live demo backend not configured. Visit later.")
     p = (prompt or "").strip()
@@ -135,8 +173,6 @@ def submit_demo(prompt, progress=gr.Progress()):
     if len(p) > 1500:
         raise gr.Error("Prompt too long (1500 char max).")
 
-    # submit
-    progress(0.01, desc="submitting")
     try:
         r = requests.post(f"{API_URL}/jobs", headers=API_HEADERS, json={
             "prompt": p, "mode": "demo", "use_critic": False,
@@ -149,11 +185,10 @@ def submit_demo(prompt, progress=gr.Progress()):
         raise gr.Error(f"submit failed: {r.text[:200]}")
     job_id = r.json()["job_id"]
 
-    yield "", "", gr.update()  # quick visual reset
+    yield f"**Job {job_id}** · submitted, waiting for GPU\n\n> {p}", None, gr.update()
 
-    # poll loop
-    deadline = time.time() + 900  # 15-min hard cap
-    last_stage = ""
+    deadline = time.time() + 900
+    last_render = ""
     while time.time() < deadline:
         time.sleep(2)
         try:
@@ -162,33 +197,31 @@ def submit_demo(prompt, progress=gr.Progress()):
             continue
         stage = meta.get("stage", "queued")
         status = meta.get("status", "queued")
-        prog = STAGE_PROGRESS.get(stage, 0.5)
-        label = STAGE_LABELS.get(stage, stage)
-        progress(prog, desc=label)
 
-        # build status text
         elapsed = int(time.time() - meta.get("started", time.time())) if meta.get("started") else 0
-        status_md = (
-            f"**Job {job_id}** · stage: `{stage}` · {elapsed}s elapsed\n\n"
-            f"> {p}"
-        )
+        if status == "queued":
+            pos = meta.get("queue_position", 0)
+            qsize = meta.get("queue_size", 1)
+            if pos:
+                status_md = f"**Job {job_id}** · queued at **position {pos} of {qsize}**, waiting for GPU\n\n> {p}"
+            else:
+                status_md = f"**Job {job_id}** · queued\n\n> {p}"
+        else:
+            label = STAGE_LABELS.get(stage, stage)
+            status_md = f"**Job {job_id}** · {label} · {elapsed}s elapsed\n\n> {p}"
 
         if status == "done":
             duration = int((meta.get("finished") or 0) - (meta.get("started") or 0))
-            video_url = f"{API_URL}/demos/{job_id}.mp4"
-            done_md = (
-                f"### Done in {duration}s\n\n"
-                f"**Job {job_id}** · saved to server, added to gallery below.\n\n"
-                f"> {p}"
-            )
-            yield done_md, video_url, gr.update(value=render_demo_grid(fetch_demos()))
+            local = cache_demo_mp4(job_id)  # download mp4 to Space's local fs
+            done_md = f"### Done in {duration}s\n\n**Job {job_id}** · saved to server, added to gallery below.\n\n> {p}"
+            yield done_md, str(local) if local else None, gr.update(value=render_demo_grid(fetch_demos()))
             return
         if status == "failed":
             raise gr.Error(f"job failed at stage `{stage}`. Check droplet logs.")
 
-        if stage != last_stage:
-            last_stage = stage
-            yield status_md, "", gr.update()
+        if status_md != last_render:
+            last_render = status_md
+            yield status_md, None, gr.update()
 
     raise gr.Error("timeout (>15 min). The droplet may be stuck or queue too long.")
 
@@ -494,6 +527,51 @@ CUSTOM_CSS = r"""
 }
 .footer a { color: #a78bfa; text-decoration: none; }
 .footer a:hover { color: #ec4899; }
+
+/* mobile - tighten everything for <=720px */
+@media (max-width: 720px) {
+  .gradio-container { padding-left: 0.5rem !important; padding-right: 0.5rem !important; }
+  .hero { padding: 1.5rem 0.7rem 1.1rem 0.7rem; border-radius: 14px; margin-bottom: 0.6rem; }
+  .hero-title { font-size: 2.4rem !important; line-height: 1.05; }
+  .hero-tagline { font-size: 0.98rem; margin-top: 0.6rem; }
+  .badge-row { gap: 0.35rem; margin-top: 1rem; }
+  .badge { font-size: 0.72rem; padding: 0.3rem 0.7rem; }
+  .stat-strip { gap: 0.5rem; margin: 0.7rem 0 1.1rem 0; }
+  .stat-tile { padding: 0.75rem 0.4rem; }
+  .stat-num { font-size: 1.55rem; }
+  .stat-lbl { font-size: 0.62rem; letter-spacing: 0.04em; }
+  .stage { padding: 0.85rem 0.95rem; gap: 0.6rem; }
+  .stage-num { flex: 0 0 2rem; height: 2rem; font-size: 0.95rem; border-radius: 9px; }
+  .stage-title { font-size: 0.96rem; }
+  .stage-meta { font-size: 0.7rem; }
+  .stage-desc { font-size: 0.82rem; line-height: 1.45; }
+  .label-card { padding: 0.7rem 0.85rem; }
+  .label-name { font-size: 0.7rem; padding: 0.18rem 0.4rem; }
+  .label-desc { font-size: 0.78rem; }
+  .label-fix { font-size: 0.74rem; }
+  .demo-grid { gap: 0.6rem; }
+  .demo-card { padding: 0.45rem; }
+  .demo-prompt { font-size: 0.78rem; }
+  .demo-meta { font-size: 0.66rem; }
+  .incident { padding: 0.75rem 0.9rem; margin: 0.6rem 0; }
+  .incident-title { font-size: 0.96rem; }
+  .incident-body { font-size: 0.82rem; line-height: 1.5; }
+  .incident-fix { font-size: 0.78rem; }
+  .perf { padding: 0.55rem 0.7rem; grid-template-columns: 1fr 4rem; }
+  .perf-label { font-size: 0.78rem; }
+  .perf-val { font-size: 0.78rem; }
+  .chart-card { padding: 0.85rem 0.9rem; }
+  .chart-title { font-size: 0.94rem; }
+  .chart-sub { font-size: 0.74rem; }
+  .stack-bar { height: 22px; }
+  .stack-seg { font-size: 0.62rem; }
+  .stack-legend { font-size: 0.72rem; gap: 0.4rem; }
+  .footer { font-size: 0.78rem; padding: 1rem 0 0.3rem 0; }
+  /* let wide markdown tables and curl pre-blocks scroll horizontally */
+  .prose table, .markdown table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+  pre { overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 0.76rem; }
+  code { word-break: break-word; }
+}
 """
 
 
@@ -1362,5 +1440,6 @@ def build_ui():
 if __name__ == "__main__":
     demo = build_ui()
     demo.queue(default_concurrency_limit=1, max_size=8).launch(
-        server_name="0.0.0.0", server_port=7860, share=False
+        server_name="0.0.0.0", server_port=7860, share=False,
+        allowed_paths=[str(DEMO_CACHE)],
     )

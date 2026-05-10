@@ -96,12 +96,42 @@ def run(prompt, outdir):
         generator=torch.Generator(device="cuda").manual_seed(5000),
     )
 
-    final = out / "demo.mp4"
-    export_to_video(out_pipe.frames[0], str(final), fps=16)
+    silent = out / "demo_silent.mp4"
+    export_to_video(out_pipe.frames[0], str(silent), fps=16)
     log.info(f"wan rendered in {(time.perf_counter()-t)/60:.2f} min")
-
     del pipe; gc.collect(); torch.cuda.empty_cache()
-    events.emit("rendered", path=str(final), minutes=round((time.perf_counter()-t)/60, 2))
+    events.emit("rendered", path=str(silent), minutes=round((time.perf_counter()-t)/60, 2))
+
+    # 3) ACE-Step v1 music, 5 seconds, derived style from prompt
+    events.emit("music_starting")
+    try:
+        import utils
+        music_style = f"cinematic ambient score matching: {prompt[:120]}, atmospheric, 75 BPM, no drums"
+        plan_stub = {"music_style": music_style}
+        music_path = utils.gen_music(plan_stub, out, duration_s=5)
+        if music_path:
+            events.emit("music_ready", path=str(music_path))
+        else:
+            events.emit("music_skipped")
+    except Exception as e:
+        log.warning(f"music gen failed: {e}")
+        events.emit("music_failed", error=str(e))
+        music_path = None
+
+    # 4) mux into final mp4
+    events.emit("mix_starting")
+    import subprocess
+    final = out / "demo.mp4"
+    if music_path and Path(music_path).exists():
+        cmd = ["ffmpeg", "-y", "-i", str(silent), "-i", str(music_path),
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(final)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not final.exists():
+            log.warning(f"ffmpeg mux failed: {r.stderr[-400:]}")
+            silent.replace(final)
+    else:
+        silent.replace(final)
+    events.emit("mix_done", path=str(final))
     events.emit("completed", final=str(final))
     return str(final)
 
