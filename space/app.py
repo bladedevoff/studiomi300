@@ -5,7 +5,7 @@ import gradio as gr
 APP_ROOT = Path(__file__).parent
 SHOWCASE_DIR = APP_ROOT / "showcase"
 
-GITHUB_URL = "https://github.com/blade54/studiomi300"  # placeholder, update on release
+GITHUB_URL = "https://github.com/bladedevoff/studiomi300"
 
 
 SHOWCASE_REELS = []  # gets repopulated when v18+ reels drop into showcase/
