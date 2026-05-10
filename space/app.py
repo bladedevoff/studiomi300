@@ -1,11 +1,18 @@
+import os
+import time
 from pathlib import Path
 
 import gradio as gr
+import requests
 
 APP_ROOT = Path(__file__).parent
 SHOWCASE_DIR = APP_ROOT / "showcase"
 
 GITHUB_URL = "https://github.com/bladedevoff/studiomi300"
+
+API_URL = (os.environ.get("STUDIO_API_URL", "") or "").rstrip("/")
+API_TOKEN = os.environ.get("STUDIO_API_TOKEN", "")
+API_HEADERS = {"X-API-Token": API_TOKEN} if API_TOKEN else {}
 
 
 SHOWCASE_REELS = [
@@ -36,6 +43,158 @@ SHOWCASE_REELS = [
 
 
 HACKATHON_BADGE = "amd-hackathon-2026"
+
+
+def fetch_demos(limit=50):
+    if not API_URL:
+        return []
+    try:
+        r = requests.get(f"{API_URL}/demos", params={"limit": limit}, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except requests.RequestException:
+        pass
+    return []
+
+
+def backend_health():
+    if not API_URL:
+        return "not configured"
+    try:
+        r = requests.get(f"{API_URL}/health", timeout=5)
+        if r.status_code == 200:
+            j = r.json()
+            return "busy (rendering)" if j.get("gpu_busy") else "idle"
+    except requests.RequestException:
+        pass
+    return "offline"
+
+
+def render_demo_card(d, full_url=True):
+    prompt = (d.get("prompt") or "")[:240]
+    url = f"{API_URL}{d['video']}" if full_url else d['video']
+    duration = d.get("duration_s") or 0
+    return (
+        f'<div class="demo-card">'
+        f'<video src="{url}" controls preload="metadata" loop muted></video>'
+        f'<div class="demo-prompt">{prompt}</div>'
+        f'<div class="demo-meta">{int(duration)}s render</div>'
+        f'</div>'
+    )
+
+
+def render_demo_grid(demos, top_n=10):
+    if not demos:
+        if not API_URL:
+            msg = "Live demo backend not configured."
+        else:
+            msg = "No live generations yet. Be the first."
+        return f'<div class="demo-empty">{msg}</div>'
+    head = demos[:top_n]
+    tail = demos[top_n:]
+    cards = "".join(render_demo_card(d) for d in head)
+    out = f'<div class="demo-grid">{cards}</div>'
+    if tail:
+        more = "".join(render_demo_card(d) for d in tail)
+        out += (
+            f'<details class="demo-more"><summary>Show {len(tail)} older'
+            f'</summary><div class="demo-grid">{more}</div></details>'
+        )
+    return out
+
+
+STAGE_LABELS = {
+    "queued": "queued",
+    "starting": "starting up",
+    "klein_loading": "loading FLUX.2 klein 4B",
+    "keyframe_starting": "painting keyframe",
+    "keyframe_ready": "keyframe ready",
+    "wan_loading": "loading Wan2.2-I2V-A14B",
+    "wan_rendering": "animating with Wan2.2",
+    "rendered": "rendered, finalising",
+    "completed": "done",
+    "done": "done",
+}
+
+STAGE_PROGRESS = {
+    "queued": 0.02, "starting": 0.04,
+    "klein_loading": 0.10, "keyframe_starting": 0.15, "keyframe_ready": 0.22,
+    "wan_loading": 0.28,
+    "wan_rendering": 0.85,
+    "rendered": 0.96,
+    "completed": 1.0, "done": 1.0,
+}
+
+
+def submit_demo(prompt, progress=gr.Progress()):
+    if not API_URL:
+        raise gr.Error("Live demo backend not configured. Visit later.")
+    p = (prompt or "").strip()
+    if len(p) < 20:
+        raise gr.Error("Prompt must be at least 20 characters.")
+    if len(p) > 1500:
+        raise gr.Error("Prompt too long (1500 char max).")
+
+    # submit
+    progress(0.01, desc="submitting")
+    try:
+        r = requests.post(f"{API_URL}/jobs", headers=API_HEADERS, json={
+            "prompt": p, "mode": "demo", "use_critic": False,
+        }, timeout=15)
+    except requests.RequestException as e:
+        raise gr.Error(f"backend unreachable: {e}")
+    if r.status_code == 401:
+        raise gr.Error("backend rejected token (Space secret out of sync)")
+    if r.status_code != 200:
+        raise gr.Error(f"submit failed: {r.text[:200]}")
+    job_id = r.json()["job_id"]
+
+    yield "", "", gr.update()  # quick visual reset
+
+    # poll loop
+    deadline = time.time() + 900  # 15-min hard cap
+    last_stage = ""
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            meta = requests.get(f"{API_URL}/jobs/{job_id}", headers=API_HEADERS, timeout=10).json()
+        except requests.RequestException:
+            continue
+        stage = meta.get("stage", "queued")
+        status = meta.get("status", "queued")
+        prog = STAGE_PROGRESS.get(stage, 0.5)
+        label = STAGE_LABELS.get(stage, stage)
+        progress(prog, desc=label)
+
+        # build status text
+        elapsed = int(time.time() - meta.get("started", time.time())) if meta.get("started") else 0
+        status_md = (
+            f"**Job {job_id}** · stage: `{stage}` · {elapsed}s elapsed\n\n"
+            f"> {p}"
+        )
+
+        if status == "done":
+            duration = int((meta.get("finished") or 0) - (meta.get("started") or 0))
+            video_url = f"{API_URL}/demos/{job_id}.mp4"
+            done_md = (
+                f"### Done in {duration}s\n\n"
+                f"**Job {job_id}** · saved to server, added to gallery below.\n\n"
+                f"> {p}"
+            )
+            yield done_md, video_url, gr.update(value=render_demo_grid(fetch_demos()))
+            return
+        if status == "failed":
+            raise gr.Error(f"job failed at stage `{stage}`. Check droplet logs.")
+
+        if stage != last_stage:
+            last_stage = stage
+            yield status_md, "", gr.update()
+
+    raise gr.Error("timeout (>15 min). The droplet may be stuck or queue too long.")
+
+
+def refresh_gallery():
+    return render_demo_grid(fetch_demos())
 
 
 CUSTOM_CSS = r"""
@@ -300,6 +459,29 @@ CUSTOM_CSS = r"""
 .placeholder-emoji { font-size: 2.4rem; margin-bottom: 0.6rem; }
 .placeholder-title { font-weight: 700; font-size: 1.1rem; color: #e2e8f0; margin-bottom: 0.4rem; }
 .placeholder-body  { font-size: 0.92rem; color: var(--text-mute); max-width: 520px; margin: 0 auto; line-height: 1.5; }
+
+/* live demo */
+.demo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 0.85rem;
+  margin: 0.6rem 0 0.3rem 0;
+}
+.demo-card {
+  background: linear-gradient(160deg, #131c33 0%, #0a1023 100%);
+  border: 1px solid var(--border-card);
+  border-radius: 12px;
+  padding: 0.6rem;
+  display: flex; flex-direction: column; gap: 0.4rem;
+}
+.demo-card video { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 16/9; object-fit: cover; }
+.demo-prompt { font-size: 0.82rem; color: #cbd5e1; line-height: 1.35; }
+.demo-meta { font-size: 0.72rem; color: var(--text-mute); letter-spacing: 0.04em; }
+.demo-empty { padding: 1.5rem 1rem; text-align: center; color: var(--text-mute); border: 1.5px dashed rgba(148,163,184,.25); border-radius: 12px; }
+.demo-more { margin-top: 0.8rem; }
+.demo-more summary { cursor: pointer; color: #c4b5fd; font-weight: 600; padding: 0.6rem 1rem; background: rgba(124,58,237,.08); border-radius: 8px; user-select: none; }
+.demo-more summary:hover { background: rgba(124,58,237,.16); }
+.demo-more[open] summary { margin-bottom: 0.8rem; }
 
 /* footer */
 .footer {
@@ -975,6 +1157,39 @@ def build_ui():
         gr.HTML(STATS_HTML)
 
         with gr.Tabs():
+
+            with gr.Tab("Live demo"):
+                gr.Markdown(
+                    "## Generate a 5-second clip on the live MI300X\n\n"
+                    "Type a prompt. The pipeline runs end-to-end on a single AMD Instinct MI300X "
+                    "via the FastAPI server on the droplet: FLUX.2 [klein] 4B paints a keyframe, "
+                    "Wan2.2-I2V-A14B animates it (81 frames at 16 fps, FBCache 0.08). "
+                    "**~6 minutes per clip**, FIFO queue across visitors. "
+                    "Every completed clip is persisted on the server and lands in the gallery below."
+                )
+                gr.Markdown(
+                    f"Backend status: **{backend_health()}** "
+                    f"(API at `{API_URL or 'not configured'}`)."
+                )
+                demo_prompt = gr.Textbox(
+                    label="Prompt",
+                    placeholder="A young woman walks through neon-lit Tokyo at night, light rain on wet streets, photorealistic",
+                    lines=2, max_lines=4,
+                )
+                demo_submit = gr.Button("Generate (~6 min)", variant="primary")
+                demo_status = gr.Markdown("")
+                demo_video = gr.Video(label="Result", autoplay=True, loop=True, interactive=False)
+
+                gr.Markdown("### Recent live generations")
+                demo_gallery = gr.HTML(value=render_demo_grid(fetch_demos()))
+                demo_refresh = gr.Button("Refresh gallery", size="sm")
+
+                demo_submit.click(
+                    submit_demo,
+                    inputs=[demo_prompt],
+                    outputs=[demo_status, demo_video, demo_gallery],
+                )
+                demo_refresh.click(refresh_gallery, outputs=[demo_gallery])
 
             with gr.Tab("Showcase"):
                 gr.Markdown(

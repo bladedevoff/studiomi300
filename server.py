@@ -25,6 +25,7 @@ GPU_LOCK = asyncio.Lock()
 class JobIn(BaseModel):
     prompt: str = Field(..., min_length=20, max_length=2000)
     use_critic: bool = True
+    mode: str = Field("full", pattern="^(full|demo)$")
 
 
 def auth(x_api_token: str = Header(default="")):
@@ -51,7 +52,7 @@ def _job_dir(job_id):
     return d
 
 
-async def _run_job(job_id, prompt, use_critic):
+async def _run_job(job_id, prompt, use_critic, mode):
     out = _job_dir(job_id)
     events_file = out / "events.jsonl"
     meta = _load(job_id) or {}
@@ -59,15 +60,22 @@ async def _run_job(job_id, prompt, use_critic):
     async with GPU_LOCK:
         meta.update({"status": "running", "started": time.time(), "stage": "starting"})
         _save(job_id, meta)
-        log.info(f"job {job_id} started")
+        log.info(f"job {job_id} started ({mode})")
 
-        cmd = [
-            "python", "-u", str(ROOT / "generate.py"),
-            "--prompt", prompt,
-            "--out", str(out),
-        ]
-        if use_critic:
-            cmd.append("--critic")
+        if mode == "demo":
+            cmd = [
+                "python", "-u", str(ROOT / "quick_demo.py"),
+                "--prompt", prompt,
+                "--out", str(out),
+            ]
+        else:
+            cmd = [
+                "python", "-u", str(ROOT / "generate.py"),
+                "--prompt", prompt,
+                "--out", str(out),
+            ]
+            if use_critic:
+                cmd.append("--critic")
 
         env = os.environ.copy()
         env.setdefault("STUDIOMI_AITER_FP8", "0")
@@ -95,14 +103,14 @@ async def _run_job(job_id, prompt, use_critic):
                     meta["stage"] = ev.get("stage", meta.get("stage"))
                     meta["last_event"] = ev
                     _save(job_id, meta)
-                except json.JSONDecodeError:
+                except Exception:
                     pass
             else:
                 meta["log_tail"] = log_tail
                 _save(job_id, meta)
         await proc.wait()
 
-        final = out / "reel_final.mp4"
+        final = out / ("demo.mp4" if mode == "demo" else "reel_final.mp4")
         ok = proc.returncode == 0 and final.exists()
         meta["status"] = "done" if ok else "failed"
         meta["stage"] = "done" if ok else meta.get("stage", "failed")
@@ -128,13 +136,49 @@ async def submit(body: JobIn, bg: BackgroundTasks):
         "id": job_id,
         "prompt": body.prompt,
         "use_critic": body.use_critic,
+        "mode": body.mode,
         "status": "queued",
         "submitted": time.time(),
         "stage": "queued",
     }
     _save(job_id, meta)
-    bg.add_task(_run_job, job_id, body.prompt, body.use_critic)
-    return {"job_id": job_id, "status": "queued"}
+    bg.add_task(_run_job, job_id, body.prompt, body.use_critic, body.mode)
+    return {"job_id": job_id, "status": "queued", "mode": body.mode}
+
+
+@app.get("/demos/{job_id}.mp4")
+async def demo_video(job_id: str):
+    # public mp4 fetch for demos so an embed in HF Space's <video> tag works without auth
+    meta = _load(job_id)
+    if meta is None:
+        raise HTTPException(404, "no such job")
+    if meta.get("mode") != "demo" or meta.get("status") != "done":
+        raise HTTPException(404, "not a completed demo")
+    return FileResponse(meta["video"], media_type="video/mp4", filename=f"demo_{job_id}.mp4")
+
+
+@app.get("/demos")
+async def demos(limit: int = 50):
+    # public, no auth: list of completed demo jobs newest-first
+    rows = []
+    for p in sorted(JOBS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            j = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if j.get("mode") != "demo" or j.get("status") != "done":
+            continue
+        rows.append({
+            "id": j["id"],
+            "prompt": j.get("prompt", ""),
+            "video": f"/demos/{j['id']}.mp4",
+            "submitted": j.get("submitted"),
+            "finished": j.get("finished"),
+            "duration_s": round((j.get("finished") or 0) - (j.get("started") or 0), 1),
+        })
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(auth)])
@@ -155,7 +199,7 @@ async def events(job_id: str):
         if line.strip():
             try:
                 out.append(json.loads(line))
-            except json.JSONDecodeError:
+            except Exception:
                 pass
     return out
 
@@ -249,6 +293,6 @@ async def list_jobs():
     for p in sorted(JOBS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
         try:
             rows.append(json.loads(p.read_text()))
-        except (json.JSONDecodeError, OSError):
+        except Exception:
             pass
     return rows[:50]
