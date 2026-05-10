@@ -670,6 +670,235 @@ SHOWCASE_PLACEHOLDER = """
 """
 
 
+STORY_TAB_MD = r"""
+## How the Director thinks
+
+The Director Agent (Qwen3.5-35B-A3B via vLLM) doesn't just write a description.
+It returns a structured 6-shot plan with named characters, per-shot prompts
+(written in Wan2.2-friendly language: camera verb first, sentence-case motion,
+positive boundary phrases), a music brief, a per-shot voice-over array, and the
+language to narrate in.
+
+```json
+{
+  "characters": {
+    "A": "Aiko (slim Japanese woman, 27, jet-black chin-length bob, ...)",
+    "B": "Kenji (Japanese man, 28, tall and lean, ...)",
+    "C": "Mei (Japanese woman, 26, shoulder-length lavender hair, ...)"
+  },
+  "story_logline": "Aiko walks alone through neon-lit Tokyo and reunites with two friends",
+  "shots": [
+    {
+      "index": 0, "is_hero": true, "shot_type": "Wide tracking",
+      "dominant_subject": "A", "cut": true,
+      "prompt": "Tracking shot following from behind at hip level. Aiko (slim Japanese woman, 27, jet-black bob, mustard yellow vinyl raincoat) walks down the center of the wet street, head turning slightly. Distant pedestrians stay blurred. Light rain falls steadily, neon signs flicker. shot on Arri Alexa, anamorphic, 35mm film grain, photorealistic"
+    },
+    "... 5 more shots ..."
+  ],
+  "music_style": "intimate ambient piano with warm pad and soft synth bell, 75 BPM, melancholic but hopeful, no drums",
+  "vo_script_per_shot": [
+    "She had been walking alone for too long.",
+    "Tonight, the city felt softer.",
+    "Two figures waited under an awning.",
+    "She broke into a quick walk.",
+    "Their arms found hers.",
+    "Some places only feel like home because of who is standing in them."
+  ],
+  "vo_lang": "j"
+}
+```
+
+The exact same character description string repeats verbatim in every shot
+that character appears in. Token-level consistency is character-LoRA-without-LoRA-training.
+
+### Six-shot story arc template
+
+| Shot | Role | Cut |
+|---|---|---|
+| 0 | Hero wide establishing - all main characters visible | true |
+| 1 | Setup - protagonist's intent or POV moves the story forward | false |
+| 2 | Other element - secondary character solo or detail insert | true if scene changes |
+| 3 | Climax - two-character moment or A-with-OBJECT | false |
+| 4 | Static medium close-up - face anchor, reduces drift accumulation | false |
+| 5 | Closing wide - scene fades or A walks away | false or true |
+
+### Voice-over languages (Kokoro-82M)
+
+Director picks the language that matches the setting. Tokyo scene -> Japanese,
+Paris -> French, Mumbai -> Hindi, Rio -> Brazilian Portuguese, anywhere else -> American English.
+
+| Code | Language | Default voice |
+|---|---|---|
+| `a` | American English | af_heart |
+| `b` | British English | bf_emma |
+| `e` | Spanish | ef_dora |
+| `f` | French | ff_siwis |
+| `h` | Hindi | hf_alpha |
+| `i` | Italian | if_sara |
+| `j` | Japanese | jf_alpha |
+| `p` | Brazilian Portuguese | pf_dora |
+| `z` | Mandarin Chinese | zf_xiaobei |
+
+The `vo_script_per_shot` array is one line per shot, 6-10 words each (~3-4 seconds
+of TTS at 150 wpm). Each Kokoro WAV gets layered onto the music bed at
+`i * 5.04 s` offset via ffmpeg `adelay`, so the narration lands when the
+visual beat lands - no description before or after the action.
+"""
+
+
+API_TAB_MD = r"""
+## Live API server
+
+The pipeline ships as a FastAPI server with an asyncio.Lock backing a strict-FIFO
+single-GPU queue. SSE event stream + per-artifact endpoints let a frontend
+render the pipeline phases as they happen, instead of waiting 45 minutes for one mp4.
+
+```bash
+# on your MI300X droplet
+STUDIO_API_TOKEN=secret uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+### Submit a job
+
+```bash
+curl -X POST https://your-droplet:8000/jobs \
+  -H "X-API-Token: secret" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "30s reel: a violinist plays in a Brooklyn subway station at midnight, golden hour light through the platform windows", "use_critic": true}'
+# -> {"job_id": "a3f9c1d2b6e8", "status": "queued"}
+```
+
+### Watch it happen
+
+```bash
+curl -N https://your-droplet:8000/jobs/a3f9c1d2b6e8/stream
+# (SSE stream)
+
+data: {"stage":"started","ts":1778425000.1,"prompt":"30s reel: ..."}
+data: {"stage":"plan_starting","ts":1778425000.5}
+data: {"stage":"plan_ready","ts":1778425245.3,"logline":"...","n_shots":6,"characters":["A"],"music_style":"...","shots":[{...}]}
+data: {"stage":"master_ready","ts":1778425248.1,"name":"A","path":"...master_A.png","seconds":7.8}
+data: {"stage":"keyframe_ready","ts":1778425250.0,"shot":0,"path":"...keyframe_00.png"}
+data: {"stage":"clip_started","ts":1778425251.2,"shot":0,"attempt":1,"flow_shift":5.0,"n_steps":30,"flf2v":true}
+data: {"stage":"clip_rendered","ts":1778425759.6,"shot":0,"path":"...clip_00.mp4","minutes":8.47}
+data: {"stage":"critic_starting","ts":1778425760.1,"shot":0,"frames":[...]}
+data: {"stage":"critic_verdict","ts":1778425853.4,"shot":0,"score":{"character_match":8,"scene_match":9,"composition":9,"artifact_free":7,"issues":["STYLIZED_AI_LOOK: ..."],"overall":8}}
+data: {"stage":"clip_passed","ts":1778425881.0,"shot":0,"attempts":1,"score":{...}}
+data: {"stage":"music_starting","ts":1778428100.0,"style":"..."}
+data: {"stage":"music_ready","ts":1778428170.4,"path":"...music.wav"}
+data: {"stage":"vo_chunk_ready","ts":1778428172.1,"shot":0,"path":"...vo_00.wav","seconds":3.4,"text":"..."}
+data: {"stage":"mix_done","ts":1778428180.0,"path":"...reel_final.mp4"}
+data: {"stage":"completed","ts":1778428180.5,"final":"...reel_final.mp4"}
+```
+
+### Per-artifact endpoints
+
+While the job runs, fetch any artifact that's already on disk:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /jobs/{id}` | full status meta with latest event |
+| `GET /jobs/{id}/events` | full jsonl event history |
+| `GET /jobs/{id}/plan` | director's plan_expanded.json |
+| `GET /jobs/{id}/master/{A,B,C,ABC,scene}` | a master keyframe png |
+| `GET /jobs/{id}/keyframe/{0..5}` | a per-shot keyframe png |
+| `GET /jobs/{id}/clip/{0..5}` | a per-shot mp4 (silent, 5 sec) |
+| `GET /jobs/{id}/music` | the 30-second music wav |
+| `GET /jobs/{id}/vo/{0..5}` | a per-shot voice-over wav |
+| `GET /jobs/{id}/video` | final mixed reel mp4 (404 while running) |
+
+`GET /jobs` returns the most recent 50 jobs. `GET /health` is auth-free for status.
+
+### Python client snippet
+
+```python
+import requests, sseclient
+
+API = "https://your-droplet:8000"
+H   = {"X-API-Token": "secret"}
+
+job = requests.post(f"{API}/jobs", headers=H, json={
+    "prompt": "30s reel: a cellist on a Brooklyn fire escape at sunset",
+    "use_critic": True,
+}).json()
+
+resp = requests.get(f"{API}/jobs/{job['job_id']}/stream", headers=H, stream=True)
+for ev in sseclient.SSEClient(resp).events():
+    print(ev.data)
+```
+
+### Multi-GPU routing
+
+Each pipeline stage can pin to its own device via env vars (defaults to `cuda:0`):
+
+```bash
+STUDIOMI_GPU_FLUX=cuda:1 \
+STUDIOMI_GPU_WAN=cuda:0 \
+STUDIOMI_GPU_ACE=cuda:1 \
+STUDIOMI_GPU_TTS=cuda:1 \
+uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+On 2x MI300X you can render the next reel's plan on card 1 while card 0 still
+animates the current reel. Tested on a single-MI300X rig - 2-card setup is
+designed but not yet validated.
+"""
+
+
+PRESET_TABLE_MD = r"""
+### Knob presets (config.py)
+
+| preset | num_frames | fps | hero / b-roll steps | FBCache | critic | est. minutes for 30s reel |
+|---|---|---|---|---|---|---|
+| **default** | 121 | 24 | 30 / 24 | 0.05 (lossless) | 7/10, 3 attempts | ~50-65 |
+| **cinematic** | 121 | 24 | 30 / 24 | 0.05 | 7/10, 3 attempts | ~50-65 |
+| **fast** | 97 | 24 | 20 / 18 | 0.08 | 6/10, 2 attempts | ~32-40 |
+| **draft** | 81 | 24 | 14 / 14 | 0.10 | 5/10, 1 attempt | ~22-28 |
+
+`STUDIOMI_AITER_FP8=1` is a separate env switch; documented but disabled by
+default until ROCm/aiter#2187 closes for the multi-shape Wan2.2 case.
+"""
+
+
+REAL_VERDICTS_MD = r"""
+### Real verdicts pulled from the run logs
+
+These are actual JSON returns from Qwen3.5-35B critiquing real Wan2.2 clips
+on this pipeline. The labels feed back into the planner's retry strategy.
+
+```json
+{ "shot": 0, "attempt": 1, "score": {
+  "character_match": 9, "scene_match": 8, "composition": 9, "artifact_free": 7,
+  "issues": ["STYLIZED_AI_LOOK: skin texture appears slightly plastic/smooth in close-up frames 1-2",
+             "OBJECT_MORPHING: background bridge structure shifts from Golden Gate to a generic suspension bridge mid-clip"],
+  "overall": 8 }}
+```
+
+```json
+{ "shot": 2, "attempt": 1, "score": {
+  "character_match": 10, "scene_match": 10, "composition": 10, "artifact_free": 9,
+  "issues": [],
+  "overall": 10 }}
+```
+
+```json
+{ "shot": 3, "attempt": 2, "score": {
+  "character_match": 4, "scene_match": 3, "composition": 2, "artifact_free": 5,
+  "issues": ["CHARACTER_DRIFT: Subject identity changes completely in final frame from long-haired woman in trench coat to bob cut and turtleneck",
+             "SCENE_MISMATCH: Golden Gate Bridge vanishes in Frame 3, replaced by generic city street",
+             "CAMERA_IGNORED: Prompt requested 'static camera' but subject rotates 180 degrees and camera zooms",
+             "STYLIZED_AI_LOOK: Frame 4 plastic skin texture and oversaturated bokeh"],
+  "overall": 3 }}
+```
+
+The 10/10 was the awning two-shot of Kenji + Mei in v22 - identity locked,
+no extras, lighting matches, no `STYLIZED_AI_LOOK` even at this resolution.
+The 3/10 was the Golden Gate Bridge overlook - Wan2.2 can't reliably render
+that landmark, drifts to generic suspension bridges. After 3 attempts the
+pipeline ships the best one and logs the issues.
+"""
+
+
 STACK_AND_GPU_MD = """
 ## The stack — every model is permissively licensed
 
@@ -807,6 +1036,7 @@ def build_ui():
                     "attempt ships and the issue list goes into the run log. The "
                     "pipeline is self-correcting, not blind."
                 )
+                gr.Markdown(REAL_VERDICTS_MD)
 
             with gr.Tab("Performance"):
                 gr.Markdown(
@@ -822,6 +1052,7 @@ def build_ui():
 
                 gr.Markdown("### Per-knob multiplier breakdown")
                 gr.HTML(render_perf_bars())
+                gr.Markdown(PRESET_TABLE_MD)
                 gr.Markdown(
                     "### What didn't work (and why)\n"
                     "| Tried | Result | Reason |\n"
@@ -847,6 +1078,12 @@ def build_ui():
                 gr.Markdown(
                     "Full incident log is in `incidents.md` in the GitHub repo."
                 )
+
+            with gr.Tab("Story & languages"):
+                gr.Markdown(STORY_TAB_MD)
+
+            with gr.Tab("Live API"):
+                gr.Markdown(API_TAB_MD)
 
             with gr.Tab("Stack & GPU"):
                 gr.Markdown(STACK_AND_GPU_MD)
