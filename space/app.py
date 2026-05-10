@@ -8,7 +8,31 @@ SHOWCASE_DIR = APP_ROOT / "showcase"
 GITHUB_URL = "https://github.com/bladedevoff/studiomi300"
 
 
-SHOWCASE_REELS = []  # gets repopulated when v18+ reels drop into showcase/
+SHOWCASE_REELS = [
+    {
+        "title": "San Francisco walk - golden hour to blue hour",
+        "video": "sf_walk.mp4",
+        "logline": "A young woman walks alone down a steep Pacific Heights street, past painted Victorians and rolling fog, to a quiet overlook of the Golden Gate Bridge as the light shifts to blue hour.",
+        "prompt": (
+            "30-second cinematic reel: a young woman walks alone through San Francisco "
+            "at golden hour - down a steep Pacific Heights street with bay views, past "
+            "painted Victorian houses, fog rolling in over the Pacific, ending at a "
+            "quiet overlook of the Golden Gate Bridge as the light shifts to blue hour"
+        ),
+        "music_style": "intimate ambient piano with a soft synth pad, 75 BPM, contemplative",
+        "vo_lang": "American English (Director picked from setting)",
+        "render_time_min": 81,
+        "shots": 6,
+        "stack_used": [
+            "Director Agent: Qwen3.5-35B-A3B (vLLM, AITER MoE)",
+            "Vision Critic: same Qwen3.5 reload, 4 frames per clip",
+            "Image: FLUX.2 [klein] 4B reference editing",
+            "Video: Wan2.2-I2V-A14B + FBCache + torch.compile + FLF2V on cut:false arcs",
+            "Music: ACE-Step v1 3.5B",
+            "Voice-over: Kokoro-82M, per-shot wavs, ffmpeg adelay sync",
+        ],
+    },
+]
 
 
 HACKATHON_BADGE = "amd-hackathon-2026"

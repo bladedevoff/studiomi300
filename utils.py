@@ -301,10 +301,10 @@ def render_clips(plan, outdir, *, use_critic=False):
     from diffusers.utils import export_to_video
 
     masters = flux_masters(plan, outdir)
-    # 6-shot plan -> 5.04 sec/clip (121 frames @ 24fps), 9-shot plan -> 3.375 sec
-    # (81 frames). Wan2.2 num_frames must be 4k+1.
-    n_shots = len(plan["shots"])
-    num_frames = 121 if n_shots == 6 else 81
+    # A14B was trained for 81 frames @ 16 fps (5.0625s) per Kijai (Wan-AI org) on
+    # HF discussion #6. Going outside that distribution (tried 121 @ 24 fps)
+    # produces visible temporal noise and rippling. num_frames must be 4k+1.
+    num_frames = 81
 
     flux_txt, flux_img = _build_flux_pipes()
     pipe = _build_wan_i2v_pipe()
@@ -426,7 +426,7 @@ def render_clips(plan, outdir, *, use_critic=False):
                     log.info(f"[clip {i}] FLF2V mode")
             out = pipe(**pipe_kwargs)
             dt = time.perf_counter() - t
-            export_to_video(out.frames[0], clip_path_str, fps=24)
+            export_to_video(out.frames[0], clip_path_str, fps=16)
             log.info(f"  done in {dt/60:.2f} min")
             _events.emit("clip_rendered", shot=i, attempt=attempt+1,
                          path=clip_path_str, minutes=round(dt/60, 2))
@@ -593,11 +593,10 @@ def gen_voiceover(plan, outdir):
     per_shot = plan.get("vo_script_per_shot")
     if isinstance(per_shot, list) and per_shot:
         outpaths = []
-        n = len(per_shot)
-        all_done = all((Path(outdir) / f"vo_{i:02d}.wav").exists() for i in range(n))
+        all_done = all((Path(outdir) / f"vo_{i:02d}.wav").exists() for i in range(len(per_shot)))
         if all_done:
-            log.info(f"per-shot VO exists, skip ({n} files)")
-            return [str(Path(outdir) / f"vo_{i:02d}.wav") for i in range(n)]
+            log.info(f"per-shot VO exists, skip ({len(per_shot)} files)")
+            return [str(Path(outdir) / f"vo_{i:02d}.wav") for i in range(len(per_shot))]
         pipe = KPipeline(lang_code=lang)
         for i, line in enumerate(per_shot):
             wav = _kokoro_say(pipe, line, voice)
@@ -623,7 +622,7 @@ def gen_voiceover(plan, outdir):
     return str(vo_path)
 
 
-CLIP_DURATION_S = 121 / 24.0  # one Wan2.2 clip at our 121-frame / 24fps config
+CLIP_DURATION_S = 81 / 16.0  # 5.0625s, native A14B training distribution
 
 
 def mix_reel(clip_paths, music_path, vo_path, output_path):
@@ -667,20 +666,19 @@ def mix_reel(clip_paths, music_path, vo_path, output_path):
                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(output_path)]
     else:
         # per-shot VO: each track delayed by i*CLIP_DURATION_S, then mixed with music bed
-        nv = len(vo_list)
         vo_inputs = [arg for p in vo_list for arg in ("-i", str(p))]
         # input indexes: 0=video, 1=music, 2..2+N-1=vo tracks
         delay_filters = []
-        for i in range(nv):
+        for i in range(len(vo_list)):
             delay_ms = int(i * CLIP_DURATION_S * 1000)
             ch = i + 2
             delay_filters.append(
                 f"[{ch}:a]adelay={delay_ms}|{delay_ms},volume=1.0,aresample=async=1[v{i}]"
             )
         bg = "[1:a]volume=0.30,aresample=async=1[bg]"
-        mix_inputs = "[bg]" + "".join(f"[v{i}]" for i in range(nv))
-        weights = " ".join(["0.6"] + ["1.0"] * nv)
-        amix = f"{mix_inputs}amix=inputs={nv+1}:duration=first:weights={weights}[mixed]"
+        mix_inputs = "[bg]" + "".join(f"[v{i}]" for i in range(len(vo_list)))
+        weights = " ".join(["0.6"] + ["1.0"] * len(vo_list))
+        amix = f"{mix_inputs}amix=inputs={len(vo_list)+1}:duration=first:weights={weights}[mixed]"
         fc = ";".join([bg, *delay_filters, amix])
         cmd = ["ffmpeg", "-y", "-i", str(video_only), "-i", str(music_path), *vo_inputs,
                "-filter_complex", fc,
