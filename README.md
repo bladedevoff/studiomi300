@@ -1,5 +1,11 @@
 # studiomi300
 
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![ROCm](https://img.shields.io/badge/ROCm-7.2-red.svg)](https://rocm.docs.amd.com/)
+[![AMD MI300X](https://img.shields.io/badge/AMD-MI300X-orange.svg)](https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html)
+[![Open Source](https://img.shields.io/badge/open%20source-Apache%202.0%20%2F%20MIT-success.svg)](#license)
+
 One prompt → 30s cinematic reel. End-to-end on a single AMD Instinct MI300X.
 Built solo for the AMD Developer Hackathon, May 2026.
 
