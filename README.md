@@ -9,6 +9,35 @@
 One prompt → 30s cinematic reel. End-to-end on a single AMD Instinct MI300X.
 Built solo for the AMD Developer Hackathon, May 2026.
 
+## architecture
+
+```mermaid
+flowchart LR
+    P([prompt]) --> D[Director Agent<br/>Qwen3.5-35B]
+    D --> CM[Character Masters<br/>FLUX.2 klein]
+    CM --> KF[Per-shot Keyframes<br/>FLUX.2 reference]
+    KF --> AN[Animation<br/>Wan2.2-I2V-A14B]
+    AN --> VC{Vision Critic<br/>Qwen3.5-35B}
+    VC -- score &lt; 7 --> AN
+    VC -- score ≥ 7 --> MX[ffmpeg mix]
+    D --> MU[Music<br/>ACE-Step v1]
+    D --> VO[Narration<br/>Kokoro-82M, 9 lang]
+    MU --> MX
+    VO --> MX
+    MX --> O([30s mp4])
+
+    classDef llm fill:#a78bfa,color:#020617,stroke:#7c3aed
+    classDef diff fill:#f472b6,color:#020617,stroke:#db2777
+    classDef vid fill:#fbbf24,color:#020617,stroke:#d97706
+    classDef io fill:#94a3b8,color:#020617,stroke:#475569
+    class D,VC llm
+    class CM,KF diff
+    class AN vid
+    class MU,VO,MX io
+```
+
+The Director also doubles as the Vision Critic — same Qwen3.5-35B checkpoint, two roles, reloaded between phases. 192 GB HBM3 is what lets four different architectures share one card.
+
 ## what it does
 
 ```
