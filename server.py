@@ -1,5 +1,6 @@
 # FastAPI wrapper. asyncio.Lock = single-MI300X FIFO queue. token via STUDIO_API_TOKEN.
 import os
+import re
 import json
 import time
 import uuid
@@ -37,7 +38,18 @@ def auth(x_api_token: str = Header(default="")):
         raise HTTPException(401, "bad token")
 
 
+# job_ids are uuid4().hex[:12] — lock down all path-building to that exact format
+# so user-supplied path components can't escape JOBS_DIR via traversal.
+_JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+
+
+def _check_job_id(job_id):
+    if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
+        raise HTTPException(400, "invalid job_id")
+
+
 def _path(job_id):
+    _check_job_id(job_id)
     return JOBS_DIR / f"{job_id}.json"
 
 
@@ -51,6 +63,7 @@ def _load(job_id):
 
 
 def _job_dir(job_id):
+    _check_job_id(job_id)
     d = JOBS_DIR / job_id
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -206,6 +219,7 @@ async def status(job_id: str):
 
 @app.get("/jobs/{job_id}/events", dependencies=[Depends(auth)])
 async def events(job_id: str):
+    _check_job_id(job_id)
     p = JOBS_DIR / job_id / "events.jsonl"
     if not p.exists():
         raise HTTPException(404, "no events yet")
@@ -221,6 +235,7 @@ async def events(job_id: str):
 
 @app.get("/jobs/{job_id}/stream")
 async def stream(job_id: str):
+    _check_job_id(job_id)
     p = JOBS_DIR / job_id / "events.jsonl"
 
     async def gen():
@@ -255,6 +270,7 @@ def _file_or_404(path: Path, mime: str):
 
 @app.get("/jobs/{job_id}/plan", dependencies=[Depends(auth)])
 async def plan(job_id: str):
+    _check_job_id(job_id)
     p = JOBS_DIR / job_id / "plan_expanded.json"
     if not p.exists():
         p = JOBS_DIR / job_id / "plan.json"
@@ -263,28 +279,38 @@ async def plan(job_id: str):
     return json.loads(p.read_text())
 
 
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
 @app.get("/jobs/{job_id}/master/{name}", dependencies=[Depends(auth)])
 async def master(job_id: str, name: str):
+    _check_job_id(job_id)
+    if not _NAME_RE.match(name):
+        raise HTTPException(400, "invalid name")
     return _file_or_404(JOBS_DIR / job_id / f"master_{name}.png", "image/png")
 
 
 @app.get("/jobs/{job_id}/keyframe/{idx}", dependencies=[Depends(auth)])
 async def keyframe(job_id: str, idx: int):
+    _check_job_id(job_id)
     return _file_or_404(JOBS_DIR / job_id / f"keyframe_{idx:02d}.png", "image/png")
 
 
 @app.get("/jobs/{job_id}/clip/{idx}", dependencies=[Depends(auth)])
 async def clip(job_id: str, idx: int):
+    _check_job_id(job_id)
     return _file_or_404(JOBS_DIR / job_id / f"clip_{idx:02d}.mp4", "video/mp4")
 
 
 @app.get("/jobs/{job_id}/music", dependencies=[Depends(auth)])
 async def music(job_id: str):
+    _check_job_id(job_id)
     return _file_or_404(JOBS_DIR / job_id / "music.wav", "audio/wav")
 
 
 @app.get("/jobs/{job_id}/vo/{idx}", dependencies=[Depends(auth)])
 async def vo_chunk(job_id: str, idx: int):
+    _check_job_id(job_id)
     p = JOBS_DIR / job_id / f"vo_{idx:02d}.wav"
     if not p.exists():
         # fallback to single-track legacy
